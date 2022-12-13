@@ -16,6 +16,8 @@ type Cron struct {
 	stop      chan struct{}
 	add       chan *Entry
 	remove    chan EntryID
+	pause     chan EntryID
+	resume    chan EntryID
 	snapshot  chan chan []Entry
 	running   bool
 	logger    Logger
@@ -69,10 +71,21 @@ type Entry struct {
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
 	Job Job
+
+	Paused bool
+
+	pauseMu *sync.Mutex
 }
 
 // Valid returns true if this is not the zero entry.
 func (e Entry) Valid() bool { return e.ID != 0 }
+
+func (e Entry) IsPaused() (status bool) {
+	e.pauseMu.Lock()
+	status = e.Paused
+	e.pauseMu.Unlock()
+	return
+}
 
 // byTime is a wrapper for sorting the entry array by time
 // (with zero time at the end).
@@ -97,17 +110,17 @@ func (s byTime) Less(i, j int) bool {
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -118,6 +131,8 @@ func New(opts ...Option) *Cron {
 		stop:      make(chan struct{}),
 		snapshot:  make(chan chan []Entry),
 		remove:    make(chan EntryID),
+		pause:     make(chan EntryID),
+		resume:    make(chan EntryID),
 		running:   false,
 		runningMu: sync.Mutex{},
 		logger:    DefaultLogger,
@@ -164,6 +179,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		Schedule:   schedule,
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
+		pauseMu:    &sync.Mutex{},
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -208,6 +224,26 @@ func (c *Cron) Remove(id EntryID) {
 		c.remove <- id
 	} else {
 		c.removeEntry(id)
+	}
+}
+
+func (c *Cron) Pause(id EntryID) {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if c.running {
+		c.pause <- id
+	} else {
+		c.pauseEntry(id)
+	}
+}
+
+func (c *Cron) Resume(id EntryID) {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if c.running {
+		c.resume <- id
+	} else {
+		c.resumeEntry(id)
 	}
 }
 
@@ -270,10 +306,12 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
+					if !e.IsPaused() {
+						c.startJob(e.WrappedJob)
+						c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
+					}
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
-					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
 			case newEntry := <-c.add:
@@ -297,6 +335,16 @@ func (c *Cron) run() {
 				now = c.now()
 				c.removeEntry(id)
 				c.logger.Info("removed", "entry", id)
+			case id := <-c.pause:
+				timer.Stop()
+				now = c.now()
+				c.pauseEntry(id)
+				c.logger.Info("paused", "entry", id)
+			case id := <-c.resume:
+				timer.Stop()
+				now = c.now()
+				c.resumeEntry(id)
+				c.logger.Info("resumed", "entry", id)
 			}
 
 			break
@@ -337,7 +385,7 @@ func (c *Cron) Stop() context.Context {
 
 // entrySnapshot returns a copy of the current cron entry list.
 func (c *Cron) entrySnapshot() []Entry {
-	var entries = make([]Entry, len(c.entries))
+	entries := make([]Entry, len(c.entries))
 	for i, e := range c.entries {
 		entries[i] = *e
 	}
@@ -352,4 +400,26 @@ func (c *Cron) removeEntry(id EntryID) {
 		}
 	}
 	c.entries = entries
+}
+
+func (c *Cron) pauseEntry(id EntryID) {
+	for i := range c.entries {
+		if c.entries[i].ID == id {
+			c.entries[i].pauseMu.Lock()
+			c.entries[i].Paused = true
+			c.entries[i].pauseMu.Unlock()
+			break
+		}
+	}
+}
+
+func (c *Cron) resumeEntry(id EntryID) {
+	for i := range c.entries {
+		if c.entries[i].ID == id {
+			c.entries[i].pauseMu.Lock()
+			c.entries[i].Paused = false
+			c.entries[i].pauseMu.Unlock()
+			break
+		}
+	}
 }

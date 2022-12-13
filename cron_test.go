@@ -388,7 +388,7 @@ func TestBlockingRun(t *testing.T) {
 	cron := newWithSeconds()
 	cron.AddFunc("* * * * * ?", func() { wg.Done() })
 
-	var unblockChan = make(chan struct{})
+	unblockChan := make(chan struct{})
 
 	go func() {
 		cron.Run()
@@ -407,7 +407,7 @@ func TestBlockingRun(t *testing.T) {
 
 // Test that double-running is a no-op
 func TestStartNoop(t *testing.T) {
-	var tickChan = make(chan struct{}, 2)
+	tickChan := make(chan struct{}, 2)
 
 	cron := newWithSeconds()
 	cron.AddFunc("* * * * * ?", func() {
@@ -667,7 +667,6 @@ func TestStopAndWait(t *testing.T) {
 		case <-time.After(time.Millisecond):
 			t.Error("context not done even when cron Stop is completed")
 		}
-
 	})
 }
 
@@ -699,4 +698,35 @@ func stop(cron *Cron) chan bool {
 // newWithSeconds returns a Cron with the seconds field enabled.
 func newWithSeconds() *Cron {
 	return New(WithParser(secondParser), WithChain())
+}
+
+func TestPauseAndResume(t *testing.T) {
+	checkNoError := func(err error) {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	t.Run("pause", func(t *testing.T) {
+		spec := "?/1 * * * * *"
+		c := New(WithSeconds())
+		var count atomic.Int64
+		id, err := c.AddFunc(spec, func() {
+			count.Add(1)
+		})
+		checkNoError(err)
+		c.Start()
+		defer c.Stop()
+		for count.Load() == 0 {
+		}
+		c.Pause(id)
+		<-time.After(5 * time.Second)
+		if count.Load() != 1 {
+			t.Error("Failed to pause job")
+		}
+		c.Resume(id)
+		<-time.After(5 * time.Second)
+		if count.Load() == 1 {
+			t.Error("Failed to resume job")
+		}
+	})
 }
